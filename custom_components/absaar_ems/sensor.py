@@ -2,7 +2,6 @@ import logging
 import requests
 import voluptuous as vol
 from datetime import timedelta
-from cachetools import TTLCache, cached
 from homeassistant.components.sensor import PLATFORM_SCHEMA, SensorEntity, SensorDeviceClass, SensorStateClass
 from homeassistant.const import CONF_USERNAME, CONF_PASSWORD
 import homeassistant.helpers.config_validation as cv
@@ -23,12 +22,6 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Required(CONF_PASSWORD): cv.string,
     }
 )
-
-# Cache data long enough for the calls from one scan but short enough to be
-# updated on the next scan
-stations_cache = TTLCache(maxsize=100, ttl=60)
-collectors_cache = TTLCache(maxsize=100, ttl=60)
-inverters_cache = TTLCache(maxsize=100, ttl=60)
 
 
 def login(username, password):
@@ -53,7 +46,6 @@ def login(username, password):
         return None, None
 
 
-@cached(stations_cache)
 def get_stations(user_id, token):
     """Fetch station list"""
     url = f"{BASE_URL}/dn/power/station/listApp"
@@ -68,7 +60,6 @@ def get_stations(user_id, token):
         return None
 
 
-@cached(collectors_cache)
 def get_collectors(power_id, token):
     """Fetch collector list"""
     url = f"{BASE_URL}/dn/power/collector/listByApp"
@@ -83,7 +74,6 @@ def get_collectors(power_id, token):
         return None
 
 
-@cached(inverters_cache)
 def get_inverter_data(power_id, inverter_id, token):
     """Fetch inverter data"""
     url = f"{BASE_URL}/dn/power/inverterData/inverterDatalist"
@@ -136,6 +126,12 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
 
         for collector in collectors.get("rows", []):
             inverter_id = collector["inverterId"]
+            inverter_data = get_inverter_data(power_id, inverter_id, token)
+            if not inverter_data or "rows" not in inverter_data or not inverter_data["rows"]:
+                _LOGGER.warning("No inverter data found for %s", collector["collectorName"])
+                continue
+
+            inverter = inverter_data["rows"][0]
 
             # Hauptsensor f++r Inverter-Leistung
             entities.append(AbsaarInverterSensor(f"{station['powerName']} Power", power_id, inverter_id, token, "acPower", "W"))
@@ -146,7 +142,7 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
                 ("acFrequency", "Hz"),
                 ("pv1Power", "W"),
                 ("pv2Power", "W"),
-                ("temperature", "°C"),
+                ("temperature", "C"),
                 ("pv1Voltage", "V"),
                 ("pv1Electric", "A"),
                 ("pv2Voltage", "V"),
@@ -192,8 +188,7 @@ class AbsaarInverterSensor(SensorEntity):
 
         if not data or "rows" not in data or not data["rows"]:
             _LOGGER.warning("No inverter data received for ID %s", self._inverter_id)
-            self._attr_native_value = None
-            self._attr_available = False
+            self._attr_native_value = "No Data"
             return
 
         inverter = data["rows"][0]
@@ -219,10 +214,8 @@ class AbsaarStationSensor(SensorEntity):
 
         if not data or "rows" not in data or not data["rows"]:
             _LOGGER.warning("No station data received for ID %s", self._power_id)
-            self._attr_native_value = None
-            self._attr_available = False
+            self._attr_native_value = "No Data"
             return
 
         station = data["rows"][0]
         self._attr_native_value = station.get("dailyPowerGeneration", 0.0)
-

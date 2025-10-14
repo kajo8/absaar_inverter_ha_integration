@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Absaar Inverter Setup",
+        "description": "Enter your Absaar EMS credentials to connect your inverter system to Home Assistant.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid username or password. Please check your credentials and try again.",
+      "cannot_connect": "Unable to connect to the Absaar EMS server. Please check your internet connection and try again later.",
+      "unknown": "An unexpected error occurred. Please try again."
+    },
+    "abort": {
+      "already_configured": "This Absaar account is already configured in Home Assistant."
+    }
+  }
+}

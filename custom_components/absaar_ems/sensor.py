@@ -1,221 +1,198 @@
+"""Sensor platform for Absaar Inverter integration."""
 import logging
-import requests
-import voluptuous as vol
-from datetime import timedelta
-from homeassistant.components.sensor import PLATFORM_SCHEMA, SensorEntity, SensorDeviceClass, SensorStateClass
-from homeassistant.const import CONF_USERNAME, CONF_PASSWORD
-import homeassistant.helpers.config_validation as cv
 
-# Disable warnings about unsecure HTTPS requests
-import urllib3
+from homeassistant.components.sensor import SensorEntity, SensorDeviceClass, SensorStateClass
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-urllib3.disable_warnings()
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-BASE_URL = "https://mini-ems.com:8081"
-SCAN_INTERVAL = timedelta(minutes=2)
 
-PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
-    {
-        vol.Required(CONF_USERNAME): cv.string,
-        vol.Required(CONF_PASSWORD): cv.string,
-    }
-)
-
-
-def login(username, password):
-    """Login to API and get authentication token"""
-    url = f"{BASE_URL}/dn/userLogin"
-    headers = {
-        "User-Agent": "okhttp-okgo/jeasonlzy",
-        "Content-Type": "application/json;charset=utf-8",
-    }
-    payload = {"username": username, "password": password}
-
-    try:
-        response = requests.post(url, headers=headers, json=payload, verify=False)
-        data = response.json()
-        if response.status_code == 200 and "token" in data:
-            return data["token"], data["userId"]
-        else:
-            _LOGGER.error("Login failed: %s", data)
-            return None, None
-    except requests.exceptions.RequestException as e:
-        _LOGGER.error("Error during login: %s", e)
-        return None, None
-
-
-def get_stations(user_id, token):
-    """Fetch station list"""
-    url = f"{BASE_URL}/dn/power/station/listApp"
-    headers = {"Authorization": str(token)}
-    payload = {"userId": str(user_id)}
-
-    try:
-        response = requests.post(url, headers=headers, data=payload, verify=False)
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        _LOGGER.error("Error fetching stations: %s", e)
-        return None
-
-
-def get_collectors(power_id, token):
-    """Fetch collector list"""
-    url = f"{BASE_URL}/dn/power/collector/listByApp"
-    headers = {"Authorization": str(token)}
-    payload = {"powerId": str(power_id)}
-
-    try:
-        response = requests.post(url, headers=headers, json=payload, verify=False)
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        _LOGGER.error("Error fetching collectors: %s", e)
-        return None
-
-
-def get_inverter_data(power_id, inverter_id, token):
-    """Fetch inverter data"""
-    url = f"{BASE_URL}/dn/power/inverterData/inverterDatalist"
-    headers = {"Authorization": token}
-    payload = {"powerId": power_id, "inverterId": inverter_id}
-
-    try:
-        response = requests.post(url, headers=headers, json=payload, verify=False)
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        _LOGGER.error("Error fetching inverter data: %s", e)
-        return None
-
-
-user_id = ""
-
-
-def setup_platform(hass, config, add_entities, discovery_info=None):
-    """Set up the sensor platform"""
-    username = config[CONF_USERNAME]
-    password = config[CONF_PASSWORD]
-
-    token, user_id = login(username, password)
-    if not token:
-        _LOGGER.error("Authentication failed")
-        return
-
-    stations = get_stations(user_id, token)
-    if not stations or "rows" not in stations:
-        _LOGGER.error("No stations found")
-        return
+async def async_setup_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    async_add_entities: AddEntitiesCallback,
+) -> None:
+    """Set up Absaar sensors from a config entry."""
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]["coordinator"]
 
     entities = []
-    for station in stations.get("rows", []):
-        power_id = station["powerId"]
 
-        # Hole dailyPowerGeneration aus den Stations-Daten
-        daily_power = station["dailyPowerGeneration"]
-        # Create the sensor for total production
-        total_power = station["totalPowerGeneration"]
-        entities.append(AbsaarStationSensor(f"{station['powerName']} totalPowerGeneration", power_id, token, total_power, "kWh"))
+    # Get data from coordinator
+    data = coordinator.data
 
-        # Erstelle den Sensor f++r die t+ñgliche Produktion
-        entities.append(AbsaarStationSensor(f"{station['powerName']} dailyPowerGeneration", power_id, token, daily_power, "kWh"))
+    if not data or "stations" not in data:
+        _LOGGER.warning("No station data available")
+        return
 
-        collectors = get_collectors(power_id, token)
-        if not collectors or "rows" not in collectors:
-            _LOGGER.warning("No collectors found for station %s", station["powerName"])
-            continue
+    for station in data["stations"]:
+        power_id = station["power_id"]
+        power_name = station["power_name"]
 
-        for collector in collectors.get("rows", []):
-            inverter_id = collector["inverterId"]
-            inverter_data = get_inverter_data(power_id, inverter_id, token)
-            if not inverter_data or "rows" not in inverter_data or not inverter_data["rows"]:
-                _LOGGER.warning("No inverter data found for %s", collector["collectorName"])
-                continue
+        # Station-level sensors
+        entities.append(
+            AbsaarStationSensor(
+                coordinator,
+                power_id,
+                power_name,
+                "dailyPowerGeneration",
+                "Daily Power Generation",
+                "kWh",
+            )
+        )
+        entities.append(
+            AbsaarStationSensor(
+                coordinator,
+                power_id,
+                power_name,
+                "totalPowerGeneration",
+                "Total Power Generation",
+                "kWh",
+            )
+        )
 
-            inverter = inverter_data["rows"][0]
+        # Inverter sensors
+        for collector in station.get("collectors", []):
+            inverter_id = collector["inverter_id"]
+            collector_name = collector["collector_name"]
 
-            # Hauptsensor f++r Inverter-Leistung
-            entities.append(AbsaarInverterSensor(f"{station['powerName']} Power", power_id, inverter_id, token, "acPower", "W"))
+            # Define sensors with their keys and units
+            sensor_definitions = [
+                ("acPower", "AC Power", "W", SensorDeviceClass.POWER),
+                ("acVoltage", "AC Voltage", "V", SensorDeviceClass.VOLTAGE),
+                ("acFrequency", "AC Frequency", "Hz", SensorDeviceClass.FREQUENCY),
+                ("acElectric", "AC Current", "A", SensorDeviceClass.CURRENT),
+                ("pv1Power", "PV1 Power", "W", SensorDeviceClass.POWER),
+                ("pv2Power", "PV2 Power", "W", SensorDeviceClass.POWER),
+                ("pv1Voltage", "PV1 Voltage", "V", SensorDeviceClass.VOLTAGE),
+                ("pv2Voltage", "PV2 Voltage", "V", SensorDeviceClass.VOLTAGE),
+                ("pv1Electric", "PV1 Current", "A", SensorDeviceClass.CURRENT),
+                ("pv2Electric", "PV2 Current", "A", SensorDeviceClass.CURRENT),
+                ("inPower", "Input Power", "W", SensorDeviceClass.POWER),
+                ("temperature", "Temperature", "°C", SensorDeviceClass.TEMPERATURE),
+            ]
 
-            # Weitere Sensoren f++r wichtige Werte
-            for key, unit in [
-                ("acVoltage", "V"),
-                ("acFrequency", "Hz"),
-                ("pv1Power", "W"),
-                ("pv2Power", "W"),
-                ("temperature", "C"),
-                ("pv1Voltage", "V"),
-                ("pv1Electric", "A"),
-                ("pv2Voltage", "V"),
-                ("pv2Electric", "A"),
-                ("acElectric", "A"),
-                ("inPower", "W"),
-            ]:
-                entities.append(AbsaarInverterSensor(f"{station['powerName']} {key}", power_id, inverter_id, token, key, unit))
+            for sensor_key, sensor_name, unit, device_class in sensor_definitions:
+                entities.append(
+                    AbsaarInverterSensor(
+                        coordinator,
+                        power_id,
+                        power_name,
+                        inverter_id,
+                        collector_name,
+                        sensor_key,
+                        sensor_name,
+                        unit,
+                        device_class,
+                    )
+                )
 
-    add_entities(entities, True)
+    async_add_entities(entities)
 
 
-class AbsaarInverterSensor(SensorEntity):
-    """Sensor for inverter data"""
+class AbsaarStationSensor(CoordinatorEntity, SensorEntity):
+    """Sensor for station-level data."""
 
-    def __init__(self, name, power_id, inverter_id, token, sensor_key, unit):
+    def __init__(
+        self,
+        coordinator,
+        power_id: str,
+        power_name: str,
+        sensor_key: str,
+        sensor_name: str,
+        unit: str,
+    ):
+        """Initialize the sensor."""
+        super().__init__(coordinator)
         self._power_id = power_id
-        self._inverter_id = inverter_id
-        self._token = token
+        self._power_name = power_name
         self._sensor_key = sensor_key
-        self._power_id = power_id
-        self._inverter_id = inverter_id
-        self._token = token
-        self._sensor_key = sensor_key
-
-        self._attr_name = name
+        self._attr_name = f"{power_name} {sensor_name}"
+        self._attr_unique_id = f"{power_id}_{sensor_key}"
         self._attr_native_unit_of_measurement = unit
-        self._attr_device_class = self._infer_device_class(unit)
-        self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_extra_state_attributes = {}
+        self._attr_device_class = SensorDeviceClass.ENERGY
+        self._attr_state_class = SensorStateClass.TOTAL_INCREASING
 
-    def _infer_device_class(self, unit):
+    @property
+    def native_value(self):
+        """Return the state of the sensor."""
+        if not self.coordinator.data or "stations" not in self.coordinator.data:
+            return None
+
+        for station in self.coordinator.data["stations"]:
+            if station["power_id"] == self._power_id:
+                value = station.get(self._sensor_key.replace("Generation", "_generation"))
+                if value is None:
+                    # Try with the original key
+                    value = station.get(self._sensor_key)
+                return value
+
+        return None
+
+    @property
+    def device_info(self):
+        """Return device information about this entity."""
         return {
-            "W": "power",
-            "V": "voltage",
-            "A": "current",
-            "°C": "temperature",
-            "Hz": "frequency"
-        }.get(unit)
-
-    def update(self):
-        data = get_inverter_data(self._power_id, self._inverter_id, self._token)
-
-        if not data or "rows" not in data or not data["rows"]:
-            _LOGGER.warning("No inverter data received for ID %s", self._inverter_id)
-            self._attr_native_value = "No Data"
-            return
-
-        inverter = data["rows"][0]
-        self._attr_native_value = inverter.get(self._sensor_key, 0.0)
+            "identifiers": {(DOMAIN, self._power_id)},
+            "name": f"Absaar {self._power_name}",
+            "manufacturer": "Absaar",
+            "model": "EMS Station",
+        }
 
 
-class AbsaarStationSensor(SensorEntity):
-    """Sensor for station data (e.g. daily or total energy production)"""
+class AbsaarInverterSensor(CoordinatorEntity, SensorEntity):
+    """Sensor for inverter data."""
 
-    def __init__(self, name, power_id, token, value, unit):
+    def __init__(
+        self,
+        coordinator,
+        power_id: str,
+        power_name: str,
+        inverter_id: str,
+        collector_name: str,
+        sensor_key: str,
+        sensor_name: str,
+        unit: str,
+        device_class: SensorDeviceClass,
+    ):
+        """Initialize the sensor."""
+        super().__init__(coordinator)
         self._power_id = power_id
-        self._token = token
-        # Set attributes for HA's base class to pick up
-        self._attr_name = name
+        self._power_name = power_name
+        self._inverter_id = inverter_id
+        self._collector_name = collector_name
+        self._sensor_key = sensor_key
+        self._attr_name = f"{power_name} {sensor_name}"
+        self._attr_unique_id = f"{inverter_id}_{sensor_key}"
         self._attr_native_unit_of_measurement = unit
-        self._attr_native_value = value
-        self._attr_device_class = SensorDeviceClass.ENERGY if unit == "kWh" else None
-        self._attr_state_class = SensorStateClass.TOTAL_INCREASING if unit == "kWh" else None
-        self._attr_extra_state_attributes = {}
+        self._attr_device_class = device_class
+        self._attr_state_class = SensorStateClass.MEASUREMENT
 
-    def update(self):
-        data = get_stations(user_id, self._token)
+    @property
+    def native_value(self):
+        """Return the state of the sensor."""
+        if not self.coordinator.data or "stations" not in self.coordinator.data:
+            return None
 
-        if not data or "rows" not in data or not data["rows"]:
-            _LOGGER.warning("No station data received for ID %s", self._power_id)
-            self._attr_native_value = "No Data"
-            return
+        for station in self.coordinator.data["stations"]:
+            if station["power_id"] == self._power_id:
+                for collector in station.get("collectors", []):
+                    if collector["inverter_id"] == self._inverter_id:
+                        return collector.get("data", {}).get(self._sensor_key)
 
-        station = data["rows"][0]
-        self._attr_native_value = station.get("dailyPowerGeneration", 0.0)
+        return None
+
+    @property
+    def device_info(self):
+        """Return device information about this entity."""
+        return {
+            "identifiers": {(DOMAIN, self._inverter_id)},
+            "name": f"Absaar {self._collector_name}",
+            "manufacturer": "Absaar",
+            "model": "Inverter",
+            "via_device": (DOMAIN, self._power_id),
+        }
